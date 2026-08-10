@@ -1,0 +1,17 @@
+# Secrets — never bake into an image layer
+.env
+# Local virtualenv: the image builds its own
+.venv/
+# VCS and tooling
+.git/
+.gitignore
+.github/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+# Docs — changing the README shouldn't invalidate the build cache
+README.md
+*.md
+.DS_Store
