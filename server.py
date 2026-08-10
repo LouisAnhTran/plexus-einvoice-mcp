@@ -226,10 +226,19 @@ async def deactivate_tax_submission(uen: str) -> dict:
 async def deregister_company(uen: str) -> dict:
     """Permanently remove a company from the e-invoicing network.
 
-    This deletes the registration and its tax-submission status entirely and
-    cannot be undone. Only call this when the customer has explicitly asked to
-    deregister or cancel their registration. To stop tax submission while
-    keeping the company registered, use deactivate_tax_submission instead.
+    This deletes the registration entirely and cannot be undone. Only call it
+    when the customer has explicitly asked to deregister or cancel. To stop tax
+    submission while keeping the company registered, use
+    deactivate_tax_submission instead.
+
+    Requires tax submission to be off first. This is rejected unless taxStatus
+    is null (never enabled) or DEACTIVATED. If the company still has tax
+    submission ACTIVATED or PENDING_ACTIVATION, tell the customer it must be
+    deactivated before deregistering, and offer to call
+    deactivate_tax_submission — do not call it on their behalf without asking,
+    since deactivating is itself a change they may not want yet. Deactivation
+    is not instant: taxStatus passes through PENDING_DEACTIVATION for a short
+    period, and deregistering only becomes possible once it reads DEACTIVATED.
 
     Args:
         uen: The company's Unique Entity Number, e.g. "202400100A".

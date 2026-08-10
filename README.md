@@ -85,6 +85,15 @@ connection time** and cache the result; only `tools/call` runs per invocation.
 
 <sub>`*` required. Hints are MCP `ToolAnnotations` — clients use them to decide what needs confirmation.</sub>
 
+> [!IMPORTANT]
+> **`deregister_company` requires tax submission to be off first.** It is
+> rejected unless `taxStatus` is `null` or `DEACTIVATED` — the upstream API
+> enforces this, so it holds for any caller, not just this server. The correct
+> sequence is `deactivate_tax_submission` → wait for `DEACTIVATED` →
+> `deregister_company`, and the tool description tells the model to *offer*
+> deactivation rather than silently doing it, since that is a change the
+> customer may not want yet.
+
 ### Two design decisions
 
 **Tools take a bare UEN.** The model passes `"202400100A"`; the server builds
