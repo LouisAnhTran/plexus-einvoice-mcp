@@ -39,12 +39,19 @@ ENV PATH="/app/.venv/bin:$PATH" \
     MCP_PORT=9000
 
 USER app
+
+# Documentation only — EXPOSE publishes nothing. It records the default; if
+# you override MCP_PORT, publish and probe that port instead.
 EXPOSE 9000
 
 # Probes /healthz (plain HTTP) rather than /mcp — kubelet and Docker cannot
 # speak JSON-RPC. Returns 503 when the upstream API is unreachable, so an
-# unhealthy container points at the real cause.
+# unhealthy container points at the real cause. Reads MCP_PORT so it follows
+# the port the app actually bound.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD ["python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9000/healthz', timeout=4).status == 200 else 1)"]
+    CMD ["python", "-c", "import os,urllib.request,sys; port=os.environ.get('MCP_PORT','9000'); sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{port}/healthz', timeout=4).status == 200 else 1)"]
 
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "9000"]
+# Exec form, no shell: uvicorn runs as PID 1 and receives SIGTERM directly, so
+# Kubernetes gets a graceful shutdown instead of waiting out the grace period.
+# Goes through server.py's __main__ so MCP_HOST/MCP_PORT actually take effect.
+CMD ["python", "server.py"]
