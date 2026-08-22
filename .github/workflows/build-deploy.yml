@@ -1,0 +1,156 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  Build einvoice-mcp and open a PR to roll it out.
+#
+#  On every push to main:
+#     1. build linux/amd64 and push to Artifact Registry, tagged with the commit
+#     2. open a PR on plexus-gitops-helm bumping this service's `tag:`
+#
+#  Merging that PR is the deploy. Argo CD watches main of the GitOps repo with
+#  selfHeal + prune, notices the new tag, and rolls the Deployment. Nothing in
+#  this workflow touches the cluster, and no kubeconfig or cluster credential
+#  exists here — CI's only privileges are "push one image" and "open one PR".
+#
+#  Authentication is keyless. There is no service-account JSON key in GitHub
+#  secrets: the job requests a short-lived OIDC token from GitHub, and GCP's
+#  Workload Identity Federation trades it for an access token. The trust is
+#  pinned to `repo:LouisAnhTran/plexus-einvoice-mcp:ref:refs/heads/main`, so a build from
+#  any other branch — or any other repo — cannot authenticate at all.
+# ─────────────────────────────────────────────────────────────────────────────
+name: build & deploy
+
+on:
+  push:
+    branches: [main]
+    # Docs-only commits should not spend five minutes rebuilding an image whose
+    # contents are identical.
+    paths-ignore:
+      - "**/*.md"
+      - ".gitignore"
+      - "LICENSE"
+  workflow_dispatch:
+
+# Two pushes in quick succession would otherwise race on the same PR branch,
+# and the loser could leave the PR pointing at the older image. Queue instead of
+# cancelling: a build that already pushed an image should still get its PR.
+concurrency:
+  group: build-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: asia-southeast1-docker.pkg.dev/plexus-louis-2026/plexus
+  IMAGE: einvoice-mcp
+  GITOPS_REPO: LouisAnhTran/plexus-gitops-helm
+
+jobs:
+  build:
+    name: build & push image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Required for Workload Identity Federation. Without it the OIDC token is
+      # never minted and google-github-actions/auth fails with a misleading
+      # "unable to get ACTIONS_ID_TOKEN_REQUEST_URL".
+      id-token: write
+    outputs:
+      sha: ${{ steps.meta.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve image tag
+        id: meta
+        # 12 hex chars, matching the tags already in values.yaml. Never
+        # `latest`: Argo CD diffs Git, not the registry, so a mutable tag makes
+        # the rendered manifest byte-identical after a rebuild — Argo reports
+        # Synced, no pod rolls, and the cluster quietly keeps the old image.
+        run: echo "sha=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/389754641136/locations/global/workloadIdentityPools/github/providers/github
+          service_account: gh-actions-push@plexus-louis-2026.iam.gserviceaccount.com
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Authorise docker against Artifact Registry
+        run: gcloud auth configure-docker asia-southeast1-docker.pkg.dev --quiet
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          # The GKE nodes are amd64. Building on this runner happens to produce
+          # amd64 anyway, but stating it means a future arm64 runner cannot
+          # silently ship an image that CrashLoopBackOffs with "exec format
+          # error".
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ steps.meta.outputs.sha }}
+          # Layer cache across runs, so an unchanged dependency layer is not
+          # rebuilt on every commit.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          {
+            echo "### Pushed"
+            echo '```'
+            echo "${REGISTRY}/${IMAGE}:${{ steps.meta.outputs.sha }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  bump:
+    name: open GitOps PR
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the GitOps credential exists
+        # Fail loudly here rather than letting checkout fail with a bare 404,
+        # which reads as "repo does not exist" and sends you hunting the wrong
+        # problem.
+        env:
+          TOKEN: ${{ secrets.GITOPS_PAT }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::GITOPS_PAT is not set on this repository."
+            echo "It needs Contents: Read and write + Pull requests: Read and write"
+            echo "on ${GITOPS_REPO}. Add it with:"
+            echo "  gh secret set GITOPS_PAT --repo ${{ github.repository }}"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.GITOPS_REPO }}
+          ref: main
+          # The default GITHUB_TOKEN is scoped to *this* repo only, so a
+          # cross-repo checkout needs its own credential.
+          token: ${{ secrets.GITOPS_PAT }}
+
+      - name: Bump the image tag
+        run: python3 scripts/bump-tag.py "$IMAGE" "${{ needs.build.outputs.sha }}"
+
+      - uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GITOPS_PAT }}
+          # One stable branch per service, so a second push updates the open PR
+          # instead of piling up a new one. Four services can have four PRs open
+          # at once without colliding.
+          branch: bump/einvoice-mcp
+          delete-branch: true
+          commit-message: "${{ env.IMAGE }}: ${{ needs.build.outputs.sha }}"
+          title: "Deploy ${{ env.IMAGE }} @ ${{ needs.build.outputs.sha }}"
+          body: |
+            Built from ${{ github.repository }}@${{ github.sha }}
+
+            **Image**
+            ```
+            ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ needs.build.outputs.sha }}
+            ```
+
+            Merging this deploys it. Argo CD syncs `main` automatically.
+
+            - Source commit: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+            - Build run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
